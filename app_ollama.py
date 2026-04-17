@@ -12,6 +12,7 @@ import traceback
 import requests
 import time
 import re
+from rank_bm25 import BM25Okapi
 
 app = Flask(__name__)
 
@@ -62,6 +63,10 @@ def load_excel_data():
     return df
 
 df = load_excel_data()
+def tokenize(text):
+    return text.split()
+bm25_corpus = [tokenize(str(q)) for q in df["Question"]]
+bm25 = BM25Okapi(bm25_corpus)
 
 print("⚙️  Loading embedding model …")
 sentence_model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
@@ -192,21 +197,42 @@ def word_overlap(q: str, stored: str) -> float:
     return len(qw & sw) / len(qw | sw)
 
 def hybrid_search(query: str, top_k: int = 10):
-    norm  = normalize(query)
-    q_emb = (sentence_model.encode([norm], normalize_embeddings=True,
-                                   convert_to_tensor=True)
-             .cpu().numpy().astype("float32"))
-    k                  = min(top_k, len(df))
+    norm = normalize(query)
+
+    #  Semantic Search (FAISS)
+    q_emb = sentence_model.encode([norm], normalize_embeddings=True)
+    q_emb = np.array(q_emb).astype("float32")
+
+    k = min(top_k, len(df))
     distances, indices = faiss_index.search(q_emb, k)
-    best_score, best_i = -1, indices[0][0]
-    for rank in range(k):
-        sem   = float(distances[0][rank])
-        ri    = indices[0][rank]
-        olap  = word_overlap(norm, df.iloc[ri]["Question"])
-        score = 0.5 * sem + 0.5 * olap
+
+    # BM25 Search
+    tokenized_query = norm.split()
+    bm25_scores = bm25.get_scores(tokenized_query)
+
+    # Normalize BM25 scores
+    max_bm25 = max(bm25_scores) if len(bm25_scores) > 0 else 1
+
+    best_score = -1
+    best_idx = indices[0][0]
+
+    for i in range(len(indices[0])):
+        idx = indices[0][i]
+
+        sem_score = float(distances[0][i])
+        bm25_score = bm25_scores[idx]
+
+        bm25_norm = bm25_score / (max_bm25 + 1e-6)
+
+        #Hybrid score
+        score = 0.7 * sem_score + 0.3 * bm25_norm
+
         if score > best_score:
-            best_score, best_i = score, ri
-    return best_score, best_i
+            best_score = score
+            best_idx = idx
+
+    return best_score, best_idx
+
 
 # ==========================================
 # 8. Ollama Callers
@@ -434,6 +460,9 @@ def submit_head_answer(q_id, answer):
         cursor.execute("UPDATE pending_questions SET status='Answered' WHERE id=?", (q_id,))
         conn.commit()
         faiss_index = build_index(df)
+        global bm25
+        bm25_corpus = [tokenize(str(q)) for q in df["Question"]]
+        bm25 = BM25Okapi(bm25_corpus)
         return "✅ تم حفظ الإجابة وتدريب البوت بنجاح!", 200
     except Exception as e:
         print(f"❌ submit_head_answer: {e}")
