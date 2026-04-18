@@ -12,19 +12,27 @@ import traceback
 import requests
 import time
 import re
-from rank_bm25 import BM25Okapi
+from urllib.parse import quote_plus
 
 app = Flask(__name__)
 
 # ==========================================
 # 1. Configuration
 # ==========================================
-OLLAMA_MODEL  = "llama3.2:1b"
-EXCEL_FILE    = "project_data.xlsx"
-OLLAMA_HOST   = "http://localhost:11434"
+# ── Model recommendation ──────────────────────────────────────────
+# llama3.2:1b  → too small, poor Arabic, use only if RAM < 4GB
+# llama3.1:8b  → good Arabic, needs ~8GB RAM  (recommended)
+# aya:8b       → Arabic-focused, needs ~8GB RAM (best for Arabic)
+# aya:35b      → best quality, needs ~24GB RAM
+OLLAMA_MODEL = "llama3:latest"   # ← change this to aya:8b or llama3.1:8b for better Arabic
 
-THRESHOLD_DIRECT = 0.75
-THRESHOLD_MEDIUM = 0.50
+EXCEL_FILE  = "project_data.xlsx"
+OLLAMA_HOST = "http://localhost:11434"
+
+# Only skip LLM for extremely high-confidence name/email queries
+THRESHOLD_DIRECT = 0.80
+
+JUST_BASE_URL = "https://www.just.edu.jo"
 
 # ==========================================
 # 2. Database
@@ -63,10 +71,6 @@ def load_excel_data():
     return df
 
 df = load_excel_data()
-def tokenize(text):
-    return text.split()
-bm25_corpus = [tokenize(str(q)) for q in df["Question"]]
-bm25 = BM25Okapi(bm25_corpus)
 
 print("⚙️  Loading embedding model …")
 sentence_model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
@@ -106,7 +110,7 @@ def is_ollama_available():
     except Exception:
         _ollama_cache["ok"] = False
     _ollama_cache["ts"] = now
-    print(f"🔌 Ollama {'✅ Online' if _ollama_cache['ok'] else '❌ Offline'}")
+    print(f"🔌 Ollama {'✅' if _ollama_cache['ok'] else '❌ OFFLINE — responses will be DB-only'}")
     return _ollama_cache["ok"]
 
 is_ollama_available()
@@ -118,39 +122,77 @@ DIALECT_MAP = {
     "شو": "ما", "وين": "أين", "اين": "أين", "كيفش": "كيف",
     "شلون": "كيف", "ليش": "لماذا", "هيك": "هكذا",
     "بدي": "أريد", "بقدر": "أستطيع", "لازم": "يجب",
-    "هلأ": "الآن", "هلق": "الآن", "هسا": "الآن", "هساع": "الآن",
-    "اسجل": "تسجيل", "للجامعه": "في الجامعة",
-    "بدي اسجل": "كيفية التسجيل", "بقدر اسجل": "طريقة التسجيل",
-    "شغال": "يعمل", "موديل": "نموذج", "بوت": "مساعد",
+    "اسجل": "تسجيل", "سجل": "تسجيل", "يسجل": "تسجيل",
+    "للجامعه": "في الجامعة", "للجامعة": "في الجامعة",
     "ايش": "ما", "إيش": "ما", "وش": "ما",
-    "زين": "جيد", "مو": "ليس", "گلي": "أخبرني",
+    "زين": "جيد", "مو": "ليس",
+    # Tell-me noise verbs → drop entirely so they don't pollute name queries
+    "احكيلي": "", "حكيلي": "", "گلي": "", "قلي": "",
+    "خبرني": "", "أخبرني": "", "اخبرني": "",
+    "اعطيني": "", "عطيني": "",
+    # Spelling variants
+    "ايميل": "إيميل", "الايميل": "الإيميل",
+    "دكتوره": "دكتور", "الدكتوره": "الدكتور",
 }
 
+_PUNCT_RE = re.compile(r'[؟?،,\.!؛;:\-\(\)"\'«»\u200c\u200d]+')
+
+def strip_punctuation(text: str) -> str:
+    return _PUNCT_RE.sub(' ', text)
+
+def normalize_arabic(text: str) -> str:
+    text = strip_punctuation(text)
+    text = re.sub(r'[\u064B-\u065F\u0670]', '', text)
+    text = re.sub(r'[أإآٱ]', 'ا', text)
+    text = re.sub(r'ؤ', 'و', text)
+    text = re.sub(r'ئ', 'ي', text)
+    text = re.sub(r'ة', 'ه', text)
+    text = re.sub(r'ى', 'ي', text)
+    return re.sub(r'\s+', ' ', text).strip()
+
+_PREFIXES = ["لل","بال","وال","فال","كال","ال","ل","ب","و","ف","ك"]
+
+def strip_prefix(word: str) -> str:
+    for pfx in _PREFIXES:
+        if word.startswith(pfx) and len(word) > len(pfx) + 1:
+            return word[len(pfx):]
+    return word
+
 def normalize(text: str) -> str:
-    words = text.split()
-    return " ".join(DIALECT_MAP.get(w, w) for w in words)
+    words  = text.split()
+    mapped = [DIALECT_MAP.get(w, w) for w in words]
+    joined = " ".join(w for w in mapped if w)
+    return normalize_arabic(joined)
+
+_RAW_STOP = {
+    "ما","هو","هي","في","من","على","إلى","عن","مع","هل","كيف",
+    "أين","اين","متى","لماذا","الجامعي","الجامعية",
+    "ال","و","يتم","يمكن","هذا","هذه","كان","يكون",
+}
+STOP_WORDS = {normalize_arabic(w) for w in _RAW_STOP}
+STOP_WORDS |= {strip_prefix(w) for w in list(STOP_WORDS)}
 
 # ==========================================
 # 6. Intent Detection
 # ==========================================
 META_PATTERNS = [
-    r"مين\s*معي", r"من\s*أنت", r"من\s*انت", r"اسمك", r"انت\s*شو", r"شو\s*انت",
+    r"مين\s*معي", r"من\s*(أنت|انت)", r"اسمك", r"انت\s*شو", r"شو\s*انت",
     r"كيف\s*(تشتغل|تعمل|بتشتغل|بتعمل)",
-    r"شو\s*(الموديل|النموذج)",
-    r"ما\s*(الموديل|النموذج)",
+    r"شو\s*(الموديل|النموذج)", r"ما\s*(الموديل|النموذج)",
     r"ollama", r"\bllm\b", r"\bai\b",
     r"(موديل|نموذج).*(شغال|يعمل)",
     r"مين\s*(صمم|برمجك|عملك)",
 ]
 
 CONVERSATIONAL_PATTERNS = [
-    r"ليش\s*(هيك|هكذا|جاوبت|قلت|رديت|تجاوب|كذا)",
-    r"شو\s*قصدك",
-    r"وضح\s*لي|وضحلي|شرحلي|شرح\s*لي",
-    r"مش\s*(فاهم|فهمت)",
-    r"(كيف|شو|إيش|ايش)\s*(بتقدر|تقدر|بتساعد|تساعد|تعمل|بتعمل)",
-    r"(ايش|إيش|شو|ما)\s*(تعرف|تقدر|بتعرف|خدماتك)",
-    r"ساعدني|مساعدة\s*عامة",
+    r"^(كيف\s*(حالك|الحال|أحوالك|حالكم))",
+    r"^(شو|ايش|إيش)\s*(اخبارك|أخبارك)",
+    r"(عن|عن\s*ايش|عن\s*إيش)\s*(سألتك|حكينا|تحدثنا|كنا)",
+    r"(شو|ما|ايش)\s*(قلت|قلتلي|قلتيلي|كنا|كنت)\s*(نحكي|نتكلم|نقول)?",
+    r"(ليش|لماذا)\s*(هيك|هكذا|جاوبت|قلت|رديت)",
+    r"شو\s*قصدك", r"وضح\s*لي|وضحلي|شرحلي", r"مش\s*(فاهم|فهمت)",
+    r"(كيف|شو|إيش|ايش)\s*(بتقدر|تقدر|بتساعد|تساعد)\s*(تعمل|بتعمل)?$",
+    r"(ايش|إيش|شو|ما)\s*خدماتك",
     r"هل\s*أنت\s*(ذكاء|روبوت|بوت)",
     r"شكرا|شكراً|ممنون|يسلمو|يعطيك",
     r"(حلو|ممتاز|رائع|كويس|زين|منيح)\s*$",
@@ -158,88 +200,147 @@ CONVERSATIONAL_PATTERNS = [
 ]
 
 ACADEMIC_KEYWORDS = [
-    "تسجيل", "مادة", "مواد", "ساعات", "فصل", "منهج", "دكتور", "أستاذ",
-    "قسم", "جامعة", "كلية", "شعبة", "درجة", "علامة", "غياب", "امتحان",
-    "مشروع", "تخرج", "خطة", "تأديب", "انتساب", "معدل", "إيميل", "مكتب",
-    "نظام", "برنامج", "بحث", "وثيقة", "إجراء", "طلب", "استمارة",
-    "شهادة", "توثيق", "رسوم", "مالية", "منحة", "محاضرة", "اختبار",
+    "تسجيل","سجل","اسجل","يسجل","مادة","مواد","ساعات","فصل",
+    "منهج","دكتور","دكتوره","أستاذ","استاذ","مهندس",
+    "قسم","جامعة","جامعه","كلية","كليه","شعبة","درجة","علامة",
+    "غياب","امتحان","مشروع","تخرج","خطة","تأديب","انتساب",
+    "معدل","إيميل","ايميل","مكتب","نظام","برنامج","بحث",
+    "وثيقة","إجراء","طلب","استمارة","شهادة","توثيق","رسوم",
+    "مالية","منحة","محاضرة","اختبار","جدول",
 ]
 
 def _matches(text: str, patterns: list) -> bool:
     t = text.lower()
     return any(re.search(p, t) for p in patterns)
 
-def classify_intent(query: str) -> str:
-    if _matches(query, META_PATTERNS):
+def classify_intent(raw_query: str) -> str:
+    norm_q = normalize(raw_query)
+    if _matches(raw_query, META_PATTERNS) or _matches(norm_q, META_PATTERNS):
         return "meta"
-    if _matches(query, CONVERSATIONAL_PATTERNS):
+    if _matches(raw_query, CONVERSATIONAL_PATTERNS) or _matches(norm_q, CONVERSATIONAL_PATTERNS):
         return "conversational"
-    if any(kw in query for kw in ACADEMIC_KEYWORDS):
+    if (any(kw in raw_query for kw in ACADEMIC_KEYWORDS)
+            or any(kw in norm_q for kw in ACADEMIC_KEYWORDS)):
         return "academic"
-    if len(query.split()) <= 5:
+    if len(raw_query.split()) <= 2:
         return "conversational"
     return "unknown"
 
 # ==========================================
-# 7. FAISS Search
+# 7. FAISS Retrieval
 # ==========================================
-STOP_WORDS = {
-    "ما","هو","هي","في","من","على","إلى","عن","مع","هل","كيف",
-    "أين","متى","لماذا","الجامعي","الجامعية","للدكتور","للدكتورة",
-    "مكتب","الإيميل","ايميل","ال","و","يتم","يمكن","هذا","هذه",
-}
-
 def word_overlap(q: str, stored: str) -> float:
-    qw = set(q.split()) - STOP_WORDS
-    sw = set(str(stored).split()) - STOP_WORDS
+    norm_q = normalize_arabic(q)
+    norm_s = normalize_arabic(str(stored))
+    qw = {strip_prefix(w) for w in norm_q.split()} - STOP_WORDS
+    sw = {strip_prefix(w) for w in norm_s.split()} - STOP_WORDS
     if not qw or not sw:
         return 0.0
     return len(qw & sw) / len(qw | sw)
 
-def hybrid_search(query: str, top_k: int = 10):
+_NAME_TRIGGERS = {"الدكتور","الاستاذ","دكتور","استاذ",
+                  "الدكتوره","الاستاذه","المهندس","مهندس"}
+
+def retrieve_top_k(query: str, top_k: int = 5) -> list[dict]:
     norm = normalize(query)
+    is_name_query = any(w in norm for w in _NAME_TRIGGERS)
+    sem_w  = 0.20 if is_name_query else 0.50
+    olap_w = 0.80 if is_name_query else 0.50
 
-    #  Semantic Search (FAISS)
-    q_emb = sentence_model.encode([norm], normalize_embeddings=True)
-    q_emb = np.array(q_emb).astype("float32")
-
-    k = min(top_k, len(df))
+    q_emb = (sentence_model.encode([norm], normalize_embeddings=True,
+                                   convert_to_tensor=True)
+             .cpu().numpy().astype("float32"))
+    k = min(max(top_k * 2, 10), len(df))
     distances, indices = faiss_index.search(q_emb, k)
 
-    # BM25 Search
-    tokenized_query = norm.split()
-    bm25_scores = bm25.get_scores(tokenized_query)
+    scored = []
+    for rank in range(k):
+        sem  = float(distances[0][rank])
+        ri   = indices[0][rank]
+        olap = word_overlap(norm, df.iloc[ri]["Question"])
+        score = sem_w * sem + olap_w * olap
+        scored.append((score, ri))
 
-    # Normalize BM25 scores
-    max_bm25 = max(bm25_scores) if len(bm25_scores) > 0 else 1
-
-    best_score = -1
-    best_idx = indices[0][0]
-
-    for i in range(len(indices[0])):
-        idx = indices[0][i]
-
-        sem_score = float(distances[0][i])
-        bm25_score = bm25_scores[idx]
-
-        bm25_norm = bm25_score / (max_bm25 + 1e-6)
-
-        #Hybrid score
-        score = 0.7 * sem_score + 0.3 * bm25_norm
-
-        if score > best_score:
-            best_score = score
-            best_idx = idx
-
-    return best_score, best_idx
-
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [
+        {"score": s, "question": str(df.iloc[ri]["Question"]),
+         "answer": str(df.iloc[ri]["Answer"])}
+        for s, ri in scored[:top_k]
+    ]
 
 # ==========================================
-# 8. Ollama Callers
+# 8. JUST Website Fallback
+# ==========================================
+_WEB_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "ar,en;q=0.9",
+}
+
+def _fetch_text(url: str, timeout: int = 8) -> str | None:
+    try:
+        r = requests.get(url, headers=_WEB_HEADERS, timeout=timeout)
+        if r.status_code != 200:
+            return None
+        text = re.sub(r'<[^>]+>', ' ', r.text)
+        text = re.sub(r'&[a-z]+;', ' ', text)
+        return re.sub(r'\s+', ' ', text).strip()
+    except Exception as e:
+        print(f"⚠️ fetch: {e}")
+        return None
+
+def search_just_website(query: str) -> str | None:
+    print(f"🌐 Searching JUST for: {query[:60]}")
+    snippets = []
+    try:
+        ddg_url = ("https://html.duckduckgo.com/html/?q="
+                   + quote_plus(f"site:just.edu.jo {query}"))
+        text = _fetch_text(ddg_url)
+        if text:
+            snippets.append(text[:1200])
+    except Exception as e:
+        print(f"⚠️ DDG: {e}")
+
+    staff_url = (
+        "https://www.just.edu.jo/FacultiesAndDepartments/"
+        "FacultyofComputer/Departments/DataScience/Pages/Staff.aspx"
+    )
+    text = _fetch_text(staff_url)
+    if text:
+        q_words = [w for w in normalize(query).split()
+                   if len(w) > 3 and w not in STOP_WORDS]
+        for qw in q_words:
+            idx = text.find(qw)
+            if idx != -1:
+                snippets.append(text[max(0, idx - 80): idx + 400])
+                break
+        if not snippets:
+            snippets.append(text[:1000])
+
+    if not snippets:
+        return None
+
+    context = "\n---\n".join(snippets[:4])
+    result = _call_ollama([
+        {"role": "system", "content": (
+            "أنت مساعد أكاديمي. فيما يلي مقاطع من الموقع الرسمي لجامعة العلوم والتكنولوجيا. "
+            "استخرج الإجابة المباشرة من هذه المقاطع فقط. "
+            "إذا لم تجد الإجابة، أجب بـ 'مجهول' فقط.\n\n" + f"المقاطع:\n{context}"
+        )},
+        {"role": "user", "content": query},
+    ])
+    if result and "مجهول" not in result:
+        return f"(المصدر: الموقع الرسمي للجامعة)\n{result}"
+    return None
+
+# ==========================================
+# 9. LLM Callers
 # ==========================================
 BOT_PERSONA = (
     "أنت مرشد أكاديمي ذكي اسمك 'المرشد الأكاديمي'، "
-    "متخصص في قسم علم البيانات بجامعة العلوم والتكنولوجيا. "
+    "متخصص في قسم علم البيانات بجامعة العلوم والتكنولوجيا الأردنية. "
     "أجب دائماً بالعربية بأسلوب ودي، واضح، ومختصر. "
 )
 
@@ -255,196 +356,194 @@ def _call_ollama(messages: list) -> str | None:
         _ollama_cache["ts"] = 0
         return None
 
-def ollama_conversational(query: str, history: list) -> str:
-    """Free-form: greetings, feedback, clarifications, meta-chat."""
-    system = (
-        BOT_PERSONA +
-        "يمكنك الإجابة على الأسئلة العامة والمحادثات اليومية بشكل طبيعي. "
-        "إذا سألك أحد عن قدراتك، اشرح أنك تساعد في شؤون قسم علم البيانات. "
-        "إذا انتقد المستخدم إجابة سابقة، اعتذر ووضح بشكل أفضل. "
-        "لا تختلق معلومات أكاديمية غير موجودة في قاعدة بياناتك."
-    )
-    msgs = [{"role": "system", "content": system}]
-    for m in history[-6:]:
-        msgs.append(m if isinstance(m, dict) else {"role": "user", "content": m[0]})
-    msgs.append({"role": "user", "content": query})
-    return _call_ollama(msgs) or _rule_based_conversational(query)
+def ollama_chat(query: str, history: list, db_context: str | None = None) -> str | None:
+    """
+    Returns the LLM answer or None if Ollama is unavailable.
+    Caller is responsible for handling None with a DB fallback.
+    """
+    context_block = ""
+    if db_context:
+        context_block = (
+            "\n\nلديك المعلومات الأكاديمية التالية من قاعدة بيانات القسم "
+            "(استخدمها إذا كانت ذات صلة بالسؤال، وتجاهلها إذا كان السؤال عاماً):\n"
+            f"{db_context}\n"
+        )
 
-def ollama_academic(query: str, history: list, data_context: str) -> str | None:
-    """Strict academic answering. Returns None if model says unknown."""
     system = (
-        BOT_PERSONA +
-        "استخدم فقط البيانات الرسمية التالية للإجابة بدقة وإيجاز:\n\n"
-        f"{data_context}\n\n"
-        "إذا لم تجد إجابة واضحة في البيانات، أجب بكلمة 'مجهول' فقط."
+        BOT_PERSONA
+        + "يمكنك الإجابة على أي سؤال: أكاديمي أو اجتماعي أو عام.\n"
+        + "• إذا كان السؤال أكاديمياً وتوجد معلومة في السياق → استخدمها وأجب مباشرةً.\n"
+        + "• إذا كان السؤال اجتماعياً أو عاماً (تحية، كيف حالك، امثله...) → أجب بشكل ودي طبيعي.\n"
+        + "• إذا طلب المستخدم أمثلة → أعطه أمثلة من قائمة ما يمكنك مساعدته به.\n"
+        + "• إذا كان السؤال أكاديمياً وليس في السياق إجابة → أجب بكلمة 'مجهول' فقط.\n"
+        + "• إذا سألك عن محادثة سابقة → راجع تاريخ المحادثة وأجب.\n"
+        + "لا تختلق أرقام غرف، إيميلات، أو معلومات غير موجودة في السياق."
+        + context_block
     )
-    msgs = [{"role": "system", "content": system}]
-    for m in history[-4:]:
-        msgs.append(m if isinstance(m, dict) else {"role": "user", "content": m[0]})
-    msgs.append({"role": "user", "content": query})
-    result = _call_ollama(msgs)
-    if result and "مجهول" not in result:
-        return result
-    return None
 
-def _rule_based_conversational(query: str) -> str:
-    """Fallback when Ollama is offline."""
-    q = query.lower()
-    if any(w in q for w in ["ليش", "لماذا", "ليه"]):
-        return (
-            "عذراً إذا لم تكن إجابتي السابقة واضحة! 😊 "
-            "أنا أبحث في قاعدة البيانات الأكاديمية للعثور على أقرب إجابة. "
-            "هل يمكنك إعادة صياغة سؤالك بشكل أكثر تفصيلاً؟"
-        )
-    if any(w in q for w in ["كيف", "تساعد", "تقدر", "ساعدني", "خدمات"]):
-        return (
-            "يسعدني مساعدتك في 🎓:\n"
-            "• تسجيل المواد والجداول الدراسية\n"
-            "• معلومات الدكاترة والمكاتب\n"
-            "• الأنظمة والتعليمات الجامعية\n"
-            "• متطلبات التخرج والخطط الدراسية\n\n"
-            "فقط اسألني!"
-        )
-    if any(w in q for w in ["مين معي", "من أنت", "اسمك", "انت شو"]):
-        return (
-            "أنا المرشد الأكاديمي الذكي 🤖\n"
-            "مساعدك في قسم علم البيانات بجامعة العلوم والتكنولوجيا.\n"
-            "كيف أقدر أساعدك اليوم؟"
-        )
-    if any(w in q for w in ["شكرا", "ممنون", "يسلمو"]):
-        return "العفو! يسعدني خدمتك دائماً 😊 هل تحتاج شيئاً آخر؟"
-    return (
-        "أنا هنا لمساعدتك! 😊 "
-        "يمكنك سؤالي عن أي شيء يخص قسم علم البيانات."
-    )
+    msgs = [{"role": "system", "content": system}]
+    for m in history[-8:]:
+        if isinstance(m, dict):
+            msgs.append(m)
+        elif isinstance(m, (list, tuple)) and len(m) >= 2:
+            msgs.append({"role": "user",      "content": str(m[0])})
+            msgs.append({"role": "assistant", "content": str(m[1])})
+    msgs.append({"role": "user", "content": query})
+
+    return _call_ollama(msgs)   # None if Ollama is offline
 
 # ==========================================
-# 9. Meta Answers (no Ollama needed)
+# 10. Meta Answers (no LLM needed)
 # ==========================================
 def meta_answer(query: str) -> str | None:
-    q = query.lower()
-    if any(w in q for w in ["اسمك", "من أنت", "من انت", "مين انت", "انت شو", "شو انت", "مين معي"]):
+    q = normalize(query).lower()
+    if any(w in q for w in ["اسمك","من انت","مين انت","انت شو","شو انت","مين معي"]):
         return (
-            "أنا **المرشد الأكاديمي الذكي** 🎓\n"
+            "إنا **المرشد الأكاديمي الذكي** 🎓\n"
             "مساعد آلي مخصص لقسم علم البيانات في جامعة العلوم والتكنولوجيا.\n"
-            "أستطيع الإجابة على أسئلتك الأكاديمية المتعلقة بالقسم."
+            "أستطيع مساعدتك في أسئلتك الأكاديمية أو حتى مجرد الدردشة! 😊"
         )
-    if any(w in q for w in ["موديل", "نموذج", "ollama", "llm", "شغال", "يشتغل"]):
+    if any(w in q for w in ["موديل","نموذج","ollama","llm"]):
         ok = is_ollama_available()
         return (
             f"**النموذج:** {OLLAMA_MODEL} عبر Ollama\n"
-            f"**حالة Ollama:** {'✅ متصل ويعمل' if ok else '❌ غير متصل حالياً'}\n"
+            f"**حالة Ollama:** {'✅ متصل ويعمل' if ok else '❌ غير متصل — الإجابات من قاعدة البيانات فقط'}\n"
             f"**نموذج التضمين:** paraphrase-multilingual-MiniLM-L12-v2\n"
             f"**قاعدة البيانات:** {len(df)} سؤال وجواب"
         )
     if re.search(r"كيف\s*(تشتغل|تعمل)", q):
         return (
-            "أعمل بثلاث طبقات 🔍:\n"
-            "**1️⃣ FAISS:** أبحث في قاعدة الأسئلة الأكاديمية\n"
-            "**2️⃣ Ollama:** إذا احتجت فهماً أعمق أستشير النموذج\n"
-            "**3️⃣ Escalation:** إذا كان السؤال جديداً، أحوّله لرئيس القسم"
+            "أعمل بأربع طبقات 🔍:\n"
+            "**1️⃣ FAISS:** أسترجع السياق ذو الصلة\n"
+            "**2️⃣ Ollama (LLM):** أفهم السؤال وأصيغ الإجابة\n"
+            "**3️⃣ JUST Website:** أبحث في الموقع الرسمي إذا احتجت\n"
+            "**4️⃣ Escalation:** أحوّل للقسم إذا السؤال جديد تماماً"
         )
     if re.search(r"مين\s*(صمم|برمجك|عملك)", q):
         return "تم تطويري كمشروع تخرج في قسم علم البيانات 🎓"
     return None
 
 # ==========================================
-# 10. Main Bot Logic
+# 11. Main Bot Logic
 # ==========================================
 def ask_smart_bot(user_query: str, history: list) -> str:
+    """
+    Flow:
+      1. Meta → instant rule-based
+      2. Pure greetings → LLM only (no DB)
+      3. Everything else:
+         a. Retrieve top-5 from FAISS
+         b. For high-conf name queries → return DB directly (avoid LLM hallucination)
+         c. Call LLM with DB context
+         d. If LLM unavailable → return best DB answer directly (NO canned fallback)
+         e. If LLM says مجهول → try web → escalate
+    """
     try:
         query  = user_query.strip()
         intent = classify_intent(query)
-        print(f"🧠 Intent={intent!r} | Q={query[:70]}")
+        print(f"🧠 Intent={intent!r} | Ollama={'✅' if is_ollama_available() else '❌'} | Q={query[:60]}")
 
-        # Step 1 — Meta (bot identity / tech info)
+        # ── 1. Meta ─────────────────────────────────────────────────
         if intent == "meta":
             ans = meta_answer(query)
-            return ans if ans else ollama_conversational(query, history)
+            if ans:
+                return ans
+            llm = ollama_chat(query, history)
+            return llm or meta_answer("من أنت")  # last resort
 
-        # Step 2 — Greetings
-        GREETINGS = {"هلا", "مرحبا", "السلام عليكم", "يعطيك العافية",
-                     "شكرا", "شكراً", "أهلا", "مرحباً", "صباح الخير",
-                     "مساء الخير", "ممنون", "يسلمو", "هلو", "هاي"}
-        if any(g in query for g in GREETINGS) and len(query.split()) <= 5:
-            return ollama_conversational(query, history)
+        # ── 2. Pure greetings ────────────────────────────────────────
+        PURE_GREETINGS = {"هلا","مرحبا","السلام عليكم","يعطيك العافية",
+                          "أهلا","مرحباً","صباح الخير","مساء الخير",
+                          "هلو","هاي","أهلاً","أهلين"}
+        if any(g in query for g in PURE_GREETINGS) and len(query.split()) <= 4:
+            llm = ollama_chat(query, history)
+            return llm or "أهلاً وسهلاً! 😊 كيف يمكنني مساعدتك اليوم؟"
 
-        # Step 3 — Conversational / feedback (never escalate these)
-        if intent == "conversational":
-            return ollama_conversational(query, history)
-
-        # Step 4 — Build enriched search query (add context if needed)
-        search_query  = query
-        CONTEXT_WORDS = {"طيب", "شو", "وين", "كيف", "ها", "عن", "اين", "أين", "هيك"}
-        is_contextual = any(w in query for w in CONTEXT_WORDS) or len(query.split()) <= 3
-        if is_contextual and history:
+        # ── 3. Retrieve FAISS context ────────────────────────────────
+        search_query = query
+        CONTEXT_WORDS = {"طيب","وين","عن","اين","أين","هيك"}
+        if any(w in query.split() for w in CONTEXT_WORDS) or len(query.split()) <= 3:
             for msg in reversed(history):
                 if isinstance(msg, dict) and msg.get("role") == "user":
                     lq = msg.get("content", "")
                     if lq and lq != query:
-                        search_query = f"{query} (سياق: {lq})"
+                        search_query = f"{query} {lq}"
                     break
 
-        # Step 5 — FAISS
-        best_score, best_idx = hybrid_search(search_query)
-        fallback_answer = (
-            str(df.iloc[best_idx]["Answer"]) if best_score >= THRESHOLD_MEDIUM else None
-        )
+        hits       = retrieve_top_k(search_query, top_k=5)
+        best_score = hits[0]["score"] if hits else -1
+        best_ans   = hits[0]["answer"] if hits else None
 
-        # Step 6 — Direct match
-        if best_score >= THRESHOLD_DIRECT:
-            print(f"✅ Direct hit ({best_score:.2f})")
-            return str(fallback_answer)
+        # ── 4. High-confidence name/email → skip LLM (no hallucination) ─
+        norm_q = normalize(query)
+        is_name_q = any(w in norm_q for w in _NAME_TRIGGERS)
+        if best_score >= THRESHOLD_DIRECT and is_name_q:
+            print(f"✅ Direct name-hit ({best_score:.2f})")
+            return str(best_ans)
 
-        # Step 7 — Medium match → Ollama with focused context
-        if best_score >= THRESHOLD_MEDIUM:
-            print(f"🔶 Medium ({best_score:.2f}) → Ollama")
-            norm  = normalize(search_query)
-            q_emb = (sentence_model.encode([norm], normalize_embeddings=True,
-                                           convert_to_tensor=True)
-                     .cpu().numpy().astype("float32"))
-            dists, idxs = faiss_index.search(q_emb, min(5, len(df)))
-            rows = [df.iloc[idxs[0][i]] for i in range(len(idxs[0]))
-                    if dists[0][i] >= THRESHOLD_MEDIUM]
-            ctx  = "\n".join(f"س: {r['Question']} | ج: {r['Answer']}" for r in rows)
-            ans  = ollama_academic(query, history, ctx)
-            return ans if ans else str(fallback_answer)
+        # ── 5. Build context string ──────────────────────────────────
+        db_context = "\n".join(
+            f"س: {h['question']}\nج: {h['answer']}" for h in hits
+        ) if hits else None
 
-        # Step 8 — Low score
-        print(f"🔴 Low score ({best_score:.2f}), intent={intent}")
+        # ── 6. Call LLM ──────────────────────────────────────────────
+        print(f"🤖 LLM | score={best_score:.2f} | intent={intent}")
+        llm_ans = ollama_chat(query, history, db_context)
 
-        if intent == "academic":
-            # Real academic gap → escalate to department head
-            cursor.execute(
-                "INSERT INTO pending_questions (user_question, status) VALUES (?, ?)",
-                (query, "Pending")
-            )
-            conn.commit()
+        # ── 7. Ollama offline → return best DB answer directly ───────
+        # FIX: NO more canned "أنا هنا لمساعدتك" when Ollama is down.
+        # If we have a DB hit, return it. If not, give a helpful offline message.
+        if llm_ans is None:
+            print("⚠️  Ollama offline — using direct DB answer")
+            if best_ans and best_score >= 0.45:
+                return str(best_ans)
+            if intent == "conversational":
+                return (
+                    "أهلاً! 😊 يمكنني مساعدتك في:\n"
+                    "• تسجيل المواد والجداول\n"
+                    "• معلومات الدكاترة والإيميلات\n"
+                    "• الأنظمة الجامعية ومتطلبات التخرج\n"
+                    "فقط اسألني!"
+                )
             return (
-                "سؤالك وصلني ✅\n"
-                "لا أملك معلومات رسمية عن هذا الموضوع حالياً، "
-                "لذا سأحوّله لرئيس القسم للرد عليك قريباً.\n"
-                "هل هناك شيء آخر يمكنني مساعدتك به؟"
+                "عذراً، النظام يعمل بوضع محدود الآن. "
+                "يرجى إعادة المحاولة أو صياغة سؤالك بشكل مختلف."
             )
 
-        # Unknown intent with low academic signal → try Ollama freely, ask for clarification if it fails
-        full_ctx = "\n".join(f"س: {r['Question']} | ج: {r['Answer']}" for _, r in df.iterrows())
-        ans = ollama_academic(query, history, full_ctx)
-        if ans:
-            return ans
-        return (
-            "لم أفهم سؤالك بشكل كافٍ 🤔\n"
-            "هل يمكنك توضيح ما تقصده؟ "
-            "أنا متخصص في شؤون قسم علم البيانات ويسعدني مساعدتك."
-        )
+        # ── 8. LLM returned مجهول → web fallback ────────────────────
+        if "مجهول" in llm_ans:
+            print("🔴 LLM said مجهول → web fallback")
+            web_ans = search_just_website(query)
+            if web_ans:
+                return web_ans
+
+            if intent == "academic":
+                cursor.execute(
+                    "INSERT INTO pending_questions (user_question, status) VALUES (?, ?)",
+                    (query, "Pending")
+                )
+                conn.commit()
+                return (
+                    "سؤالك وصلني ✅\n"
+                    "لا أملك معلومات رسمية عن هذا الموضوع حالياً، "
+                    "لذا سأحوّله لرئيس القسم للرد عليك قريباً.\n"
+                    "هل هناك شيء آخر يمكنني مساعدتك به؟"
+                )
+            return (
+                "لم أجد معلومات كافية عن هذا الموضوع 🤔\n"
+                "هل يمكنك توضيح ما تقصده؟"
+            )
+
+        # ── 9. LLM answered normally ─────────────────────────────────
+        return llm_ans
 
     except Exception as e:
-        print(f"🚨 General Error: {e}")
+        print(f"🚨 Error: {e}")
         traceback.print_exc()
         return "أواجه مشكلة تقنية مؤقتة، يرجى المحاولة مجدداً."
 
 # ==========================================
-# 11. DB Helper
+# 12. DB Helper
 # ==========================================
 def submit_head_answer(q_id, answer):
     try:
@@ -460,16 +559,13 @@ def submit_head_answer(q_id, answer):
         cursor.execute("UPDATE pending_questions SET status='Answered' WHERE id=?", (q_id,))
         conn.commit()
         faiss_index = build_index(df)
-        global bm25
-        bm25_corpus = [tokenize(str(q)) for q in df["Question"]]
-        bm25 = BM25Okapi(bm25_corpus)
         return "✅ تم حفظ الإجابة وتدريب البوت بنجاح!", 200
     except Exception as e:
         print(f"❌ submit_head_answer: {e}")
         return f"❌ خطأ: {e}", 400
 
 # ==========================================
-# 12. API Routes
+# 13. API Routes
 # ==========================================
 @app.route("/api/chat", methods=["POST"])
 def chat_api():
@@ -491,8 +587,10 @@ def answer_api():
 
 @app.route("/api/status", methods=["GET"])
 def status_api():
+    ok = is_ollama_available()
     return jsonify({
-        "ollama_online": is_ollama_available(),
+        "ollama_online": ok,
+        "ollama_warning": "❌ Ollama offline — LLM disabled, DB-only mode" if not ok else "✅ OK",
         "model":         OLLAMA_MODEL,
         "rows_loaded":   len(df),
     })
