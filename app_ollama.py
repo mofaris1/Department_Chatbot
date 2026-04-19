@@ -24,7 +24,7 @@ app = Flask(__name__)
 # llama3.1:8b  → good Arabic, needs ~8GB RAM  (recommended)
 # aya:8b       → Arabic-focused, needs ~8GB RAM (best for Arabic)
 # aya:35b      → best quality, needs ~24GB RAM
-OLLAMA_MODEL = "llama3:latest"   # ← change this to aya:8b or llama3.1:8b for better Arabic
+OLLAMA_MODEL = "llama3:latest"  # ← matches what you have installed (ollama list)
 
 EXCEL_FILE  = "project_data.xlsx"
 OLLAMA_HOST = "http://localhost:11434"
@@ -43,6 +43,149 @@ cursor.execute("""CREATE TABLE IF NOT EXISTS pending_questions
                   (id INTEGER PRIMARY KEY AUTOINCREMENT,
                    user_question TEXT, status TEXT)""")
 conn.commit()
+
+
+# ==========================================
+# PDF Knowledge Base
+# ==========================================
+import fitz   # PyMuPDF  — pip install pymupdf
+import io
+
+# ── Configure your PDF sources here ──────────────────────────────────────────
+# Add URLs (must be publicly accessible) OR local file paths.
+# The JUST server blocks bots (403), so download those PDFs manually and add
+# their local paths here. Example:
+#   "regulations.pdf"                          ← file in same folder as server.py
+#   "C:/Users/user/Downloads/gp/3.pdf"         ← absolute Windows path
+#   "https://example.com/public.pdf"           ← publicly accessible URL
+
+PDF_SOURCES = [
+    # ← add your PDF paths/URLs here, e.g.:
+    # "3.pdf",
+    # "https://www.just.edu.jo/...pdf",
+]
+
+# Chunk size in characters — smaller = more precise retrieval
+PDF_CHUNK_SIZE  = 600
+PDF_CHUNK_OVERLAP = 100   # overlap between chunks so context isn't cut mid-sentence
+
+# ─────────────────────────────────────────────────────────────────────────────
+_pdf_chunks: list[dict] = []   # [{text, source, page}]
+_pdf_index  = None             # separate FAISS index for PDF chunks
+_pdf_ready  = False
+
+def _extract_pdf_text(source: str) -> list[dict]:
+    """
+    Load a PDF from a URL or local path and return a list of
+    {text, source, page} dicts — one per page.
+    """
+    label = source if len(source) < 60 else source[-55:]
+    try:
+        if source.startswith("http://") or source.startswith("https://"):
+            r = requests.get(source, timeout=20, headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+                ),
+                "Referer": JUST_BASE_URL,
+            })
+            if r.status_code != 200:
+                print(f"⚠️  PDF HTTP {r.status_code}: {label}")
+                return []
+            data = io.BytesIO(r.content)
+        else:
+            # Local file — resolve relative paths from the script directory
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), source) \
+                   if not os.path.isabs(source) else source
+            if not os.path.exists(path):
+                print(f"⚠️  PDF not found: {path}")
+                return []
+            data = open(path, "rb")
+
+        doc   = fitz.open(stream=data.read() if hasattr(data, "read") else data,
+                          filetype="pdf")
+        pages = []
+        for i, page in enumerate(doc, 1):
+            text = page.get_text().strip()
+            if text:
+                pages.append({"text": text, "source": source, "page": i})
+        doc.close()
+        print(f"✅ PDF loaded: {label} ({len(pages)} pages)")
+        return pages
+    except Exception as e:
+        print(f"❌ PDF load error [{label}]: {e}")
+        return []
+
+def _chunk_pages(pages: list[dict]) -> list[dict]:
+    """Split page texts into overlapping chunks for finer retrieval."""
+    chunks = []
+    for p in pages:
+        text = p["text"]
+        start = 0
+        while start < len(text):
+            end   = min(start + PDF_CHUNK_SIZE, len(text))
+            chunk = text[start:end].strip()
+            if chunk:
+                chunks.append({"text": chunk, "source": p["source"], "page": p["page"]})
+            start += PDF_CHUNK_SIZE - PDF_CHUNK_OVERLAP
+    return chunks
+
+def _build_pdf_index(chunks: list[dict]):
+    """Encode all chunks and build a FAISS index."""
+    if not chunks:
+        return None
+    texts  = [c["text"] for c in chunks]
+    emb    = sentence_model.encode(texts, normalize_embeddings=True, convert_to_tensor=True)
+    emb_np = emb.cpu().numpy().astype("float32")
+    idx    = faiss.IndexFlatIP(emb_np.shape[1])
+    idx.add(emb_np)
+    return idx
+
+def load_pdfs():
+    """Call once at startup — loads all configured PDFs into memory."""
+    global _pdf_chunks, _pdf_index, _pdf_ready
+    if not PDF_SOURCES:
+        print("ℹ️  No PDF sources configured (PDF_SOURCES is empty).")
+        return
+    pages = []
+    for src in PDF_SOURCES:
+        pages.extend(_extract_pdf_text(src))
+    _pdf_chunks = _chunk_pages(pages)
+    _pdf_index  = _build_pdf_index(_pdf_chunks)
+    _pdf_ready  = bool(_pdf_chunks)
+    print(f"📄 PDF index ready: {len(_pdf_chunks)} chunks from {len(PDF_SOURCES)} source(s)")
+
+def search_pdf(query: str, top_k: int = 4) -> list[dict]:
+    """Return the top-k most relevant PDF chunks for a query."""
+    if not _pdf_ready or _pdf_index is None:
+        return []
+    norm  = normalize(query)
+    q_emb = (sentence_model.encode([norm], normalize_embeddings=True, convert_to_tensor=True)
+             .cpu().numpy().astype("float32"))
+    k         = min(top_k, len(_pdf_chunks))
+    dists, ids = _pdf_index.search(q_emb, k)
+    results = []
+    for rank in range(k):
+        score = float(dists[0][rank])
+        if score >= 0.35:   # only include chunks with reasonable relevance
+            chunk = _pdf_chunks[ids[0][rank]]
+            results.append({
+                "score":  score,
+                "text":   chunk["text"],
+                "source": chunk["source"],
+                "page":   chunk["page"],
+            })
+    return results
+
+def format_pdf_source(source: str, page: int) -> str:
+    """Return a Markdown link for the PDF source."""
+    if source.startswith("http"):
+        return f"[الصفحة {page} — {source.split('/')[-1]}]({source}#page={page})"
+    fname = os.path.basename(source)
+    return f"ملف: {fname} (صفحة {page})"
+
+# Load PDFs at startup
+load_pdfs()
 
 # ==========================================
 # 3. Data & Index
@@ -291,33 +434,65 @@ def _fetch_text(url: str, timeout: int = 8) -> str | None:
         print(f"⚠️ fetch: {e}")
         return None
 
+# Pages to search — ordered by relevance; first match wins for source attribution
+JUST_PAGES = [
+    ("صفحة أعضاء هيئة التدريس - قسم علم البيانات",
+     "https://www.just.edu.jo/FacultiesAndDepartments/FacultyofComputer/Departments/DataScience/Pages/Staff.aspx"),
+    ("قسم علم البيانات - جامعة العلوم والتكنولوجيا",
+     "https://www.just.edu.jo/FacultiesAndDepartments/FacultyofComputer/Departments/DataScience/Pages/Home.aspx"),
+    ("الموقع الرسمي لجامعة العلوم والتكنولوجيا الأردنية",
+     "https://www.just.edu.jo"),
+]
+
 def search_just_website(query: str) -> str | None:
     print(f"🌐 Searching JUST for: {query[:60]}")
-    snippets = []
+    snippets   = []   # (text_snippet, source_url, source_label)
+    source_url   = None
+    source_label = None
+
+    # ── 1. Try each JUST page directly ────────────────────────────────────
+    q_words = [w for w in normalize(query).split()
+               if len(w) > 3 and w not in STOP_WORDS]
+
+    for label, url in JUST_PAGES:
+        text = _fetch_text(url)
+        if not text:
+            continue
+        # Try to find a relevant snippet around the query keywords
+        found_snippet = None
+        for qw in q_words:
+            idx = text.find(qw)
+            if idx != -1:
+                found_snippet = text[max(0, idx - 100): idx + 500]
+                break
+        if found_snippet:
+            snippets.append(found_snippet)
+            if source_url is None:          # first hit = primary source
+                source_url   = url
+                source_label = label
+        elif not snippets:                  # fallback: use first 1000 chars
+            snippets.append(text[:1000])
+            if source_url is None:
+                source_url   = url
+                source_label = label
+
+        if len(snippets) >= 3:
+            break
+
+    # ── 2. DuckDuckGo site search as extra context ─────────────────────────
     try:
         ddg_url = ("https://html.duckduckgo.com/html/?q="
                    + quote_plus(f"site:just.edu.jo {query}"))
         text = _fetch_text(ddg_url)
         if text:
-            snippets.append(text[:1200])
+            # Extract any just.edu.jo URLs found in the DDG results
+            found_urls = re.findall(r'https?://(?:www\.)?just\.edu\.jo[^\s"\'<>]*', text)
+            if found_urls and source_url is None:
+                source_url   = found_urls[0]
+                source_label = "نتائج البحث في موقع الجامعة"
+            snippets.append(text[:1000])
     except Exception as e:
         print(f"⚠️ DDG: {e}")
-
-    staff_url = (
-        "https://www.just.edu.jo/FacultiesAndDepartments/"
-        "FacultyofComputer/Departments/DataScience/Pages/Staff.aspx"
-    )
-    text = _fetch_text(staff_url)
-    if text:
-        q_words = [w for w in normalize(query).split()
-                   if len(w) > 3 and w not in STOP_WORDS]
-        for qw in q_words:
-            idx = text.find(qw)
-            if idx != -1:
-                snippets.append(text[max(0, idx - 80): idx + 400])
-                break
-        if not snippets:
-            snippets.append(text[:1000])
 
     if not snippets:
         return None
@@ -325,23 +500,60 @@ def search_just_website(query: str) -> str | None:
     context = "\n---\n".join(snippets[:4])
     result = _call_ollama([
         {"role": "system", "content": (
-            "أنت مساعد أكاديمي. فيما يلي مقاطع من الموقع الرسمي لجامعة العلوم والتكنولوجيا. "
-            "استخرج الإجابة المباشرة من هذه المقاطع فقط. "
-            "إذا لم تجد الإجابة، أجب بـ 'مجهول' فقط.\n\n" + f"المقاطع:\n{context}"
+            "أنت مساعد أكاديمي. فيما يلي مقاطع من الموقع الرسمي لجامعة العلوم والتكنولوجيا الأردنية. "
+            "استخرج الإجابة المباشرة على سؤال المستخدم من هذه المقاطع فقط. "
+            "اكتب كلمة مجهول فقط إذا لم تجد الإجابة، لا شيء آخر.\n\n"
+            f"المقاطع:\n{context}"
         )},
         {"role": "user", "content": query},
     ])
-    if result and "مجهول" not in result:
-        return f"(المصدر: الموقع الرسمي للجامعة)\n{result}"
+
+    if result and not is_unknown_response(result):
+        # Build attribution line with actual URL
+        src_line = f"🔗 المصدر: [{source_label}]({source_url})" if source_url else "🔗 المصدر: الموقع الرسمي للجامعة"
+        return f"{result}\n\n{src_line}"
     return None
 
 # ==========================================
 # 9. LLM Callers
 # ==========================================
+
+def clean_arabic_output(text: str) -> str:
+    """
+    Remove garbage injected by llama3:
+    - CJK characters
+    - Pure Latin noise (include, pad4, yes...)
+    - Mixed Arabic+Latin tokens like مجeho (corrupted مجهول)
+    """
+    text = re.sub(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\u3400-\u4dbf\uff00-\uffef]+', '', text)
+    lines = text.split('\n')
+    cleaned = []
+    for line in lines:
+        tokens = line.split()
+        result = []
+        for tok in tokens:
+            core = re.sub(r'^[\W_]+|[\W_]+$', '', tok, flags=re.UNICODE)
+            has_arabic = bool(re.search(r'[\u0600-\u06ff]', tok))
+            has_latin  = bool(re.search(r'[a-zA-Z]', tok))
+            has_email  = '@' in tok
+            is_url     = tok.startswith(('http', 'www.'))
+            is_pure_latin_noise = (
+                bool(re.match(r'^[a-zA-Z][a-zA-Z0-9]*$', core))
+                and not has_arabic and not has_email and not is_url
+                and len(core) >= 2
+            )
+            # Mixed Arabic+Latin (مجeho, مجeho.) = always garbage
+            is_mixed_noise = has_arabic and has_latin and not has_email and not is_url
+            if not is_pure_latin_noise and not is_mixed_noise:
+                result.append(tok)
+        cleaned.append(' '.join(result))
+    return re.sub(r'[ \t]+', ' ', '\n'.join(cleaned)).strip()
+
 BOT_PERSONA = (
     "أنت مرشد أكاديمي ذكي اسمك 'المرشد الأكاديمي'، "
-    "متخصص في قسم علم البيانات بجامعة العلوم والتكنولوجيا الأردنية. "
-    "أجب دائماً بالعربية بأسلوب ودي، واضح، ومختصر. "
+    "متخصص في قسم علم البيانات بجامعة العلوم والتكنولوجيا الأردنية.\n"
+    "CRITICAL: Reply in Arabic ONLY. NEVER use English words like 'include', 'data', 'yes', 'no'. "
+    "Use Arabic equivalents always. أجب بأسلوب ودي، واضح، ومختصر.\n"
 )
 
 def _call_ollama(messages: list) -> str | None:
@@ -350,9 +562,14 @@ def _call_ollama(messages: list) -> str | None:
     try:
         resp = ollama.chat(model=OLLAMA_MODEL, messages=messages,
                            options={"temperature": 0.3})
-        return resp["message"]["content"].strip()
+        # Support both old (dict) and new (Pydantic object) ollama package
+        if hasattr(resp, "message"):
+            raw = resp.message.content.strip()
+        else:
+            raw = resp["message"]["content"].strip()
+        return clean_arabic_output(raw)
     except Exception as e:
-        print(f"🚨 Ollama error: {e}")
+        print(f"🚨 Ollama error ({type(e).__name__}): {e}")
         _ollama_cache["ts"] = 0
         return None
 
@@ -375,7 +592,7 @@ def ollama_chat(query: str, history: list, db_context: str | None = None) -> str
         + "• إذا كان السؤال أكاديمياً وتوجد معلومة في السياق → استخدمها وأجب مباشرةً.\n"
         + "• إذا كان السؤال اجتماعياً أو عاماً (تحية، كيف حالك، امثله...) → أجب بشكل ودي طبيعي.\n"
         + "• إذا طلب المستخدم أمثلة → أعطه أمثلة من قائمة ما يمكنك مساعدته به.\n"
-        + "• إذا كان السؤال أكاديمياً وليس في السياق إجابة → أجب بكلمة 'مجهول' فقط.\n"
+        + "• إذا كان السؤال أكاديمياً وليس في السياق إجابة → اكتب كلمة مجهول فقط، لا شيء آخر.\n"
         + "• إذا سألك عن محادثة سابقة → راجع تاريخ المحادثة وأجب.\n"
         + "لا تختلق أرقام غرف، إيميلات، أو معلومات غير موجودة في السياق."
         + context_block
@@ -423,6 +640,36 @@ def meta_answer(query: str) -> str | None:
         return "تم تطويري كمشروع تخرج في قسم علم البيانات 🎓"
     return None
 
+
+def is_unknown_response(text: str) -> bool:
+    """
+    Detect all variants of 'I don't know' that llama3 may output.
+    Includes mixed Arabic+Latin corruptions like مجeho.
+    """
+    # First clean the text to remove mixed-script garbage
+    t = clean_arabic_output(text.strip())
+    # After cleaning, مجeho → مج (pure Arabic chars left)
+    # Short reply starting with مج is almost certainly a corrupted مجهول
+    if len(t) <= 6 and re.match(r'^مج', t):
+        return True
+    # Standard Arabic unknown phrases
+    if len(t) <= 8 and t.startswith("مجه"):
+        return True
+    # Very short reply with no useful info (1-2 words, no academic content)
+    if len(t.split()) <= 1 and not re.search(r'[\u0660-\u0669\d]', t):
+        # Single meaningless word
+        meaningful = bool(re.search(r'(ساعة|ساعات|مادة|مواد|نعم|كلية|قسم)', t))
+        if not meaningful and len(t) <= 8:
+            return True
+    return any(v in t for v in [
+        "مجهول", "مجهم", "مجهو", "مجهل",
+        "لا أعلم", "لا أعرف", "لا أملك",
+        "غير متوفر", "غير موجود", "غير معروف",
+        "لا توجد", "لا يوجد", "لم أجد",
+        "ليس لدي معلومات", "لا تتوفر لديّ",
+        "لا أستطيع الإجابة",
+    ])
+
 # ==========================================
 # 11. Main Bot Logic
 # ==========================================
@@ -462,13 +709,18 @@ def ask_smart_bot(user_query: str, history: list) -> str:
         # ── 3. Retrieve FAISS context ────────────────────────────────
         search_query = query
         CONTEXT_WORDS = {"طيب","وين","عن","اين","أين","هيك"}
-        if any(w in query.split() for w in CONTEXT_WORDS) or len(query.split()) <= 3:
-            for msg in reversed(history):
-                if isinstance(msg, dict) and msg.get("role") == "user":
-                    lq = msg.get("content", "")
-                    if lq and lq != query:
-                        search_query = f"{query} {lq}"
+        FOLLOW_UP_WORDS = {"ايميله","ايميلها","إيميله","إيميلها","مكتبه","مكتبها","رقمه","رقمها"}
+        is_followup = any(w in query for w in FOLLOW_UP_WORDS) or len(query.split()) <= 3
+        if (any(w in query.split() for w in CONTEXT_WORDS) or is_followup) and history:
+            # Collect context from last user + last assistant messages for better name resolution
+            context_parts = []
+            for msg in reversed(history[-6:]):
+                if isinstance(msg, dict) and msg.get("content","") != query:
+                    context_parts.append(msg.get("content",""))
+                if len(context_parts) >= 2:
                     break
+            if context_parts:
+                search_query = f"{query} {' '.join(context_parts)}"
 
         hits       = retrieve_top_k(search_query, top_k=5)
         best_score = hits[0]["score"] if hits else -1
@@ -481,10 +733,23 @@ def ask_smart_bot(user_query: str, history: list) -> str:
             print(f"✅ Direct name-hit ({best_score:.2f})")
             return str(best_ans)
 
-        # ── 5. Build context string ──────────────────────────────────
-        db_context = "\n".join(
-            f"س: {h['question']}\nج: {h['answer']}" for h in hits
-        ) if hits else None
+        # ── 5. Build context: Excel DB + PDF chunks ────────────────
+        ctx_parts = []
+        if hits:
+            ctx_parts.append("[ من قاعدة البيانات ]")
+            ctx_parts.extend(f"س: {h['question']}\nج: {h['answer']}" for h in hits)
+
+        pdf_hits = search_pdf(search_query, top_k=4)
+        pdf_sources_used = []
+        if pdf_hits:
+            ctx_parts.append("\n[ من الملفات والوثائق الرسمية ]")
+            for ph in pdf_hits:
+                ctx_parts.append(ph["text"])
+                src_str = format_pdf_source(ph["source"], ph["page"])
+                if src_str not in pdf_sources_used:
+                    pdf_sources_used.append(src_str)
+
+        db_context = "\n".join(ctx_parts) if ctx_parts else None
 
         # ── 6. Call LLM ──────────────────────────────────────────────
         print(f"🤖 LLM | score={best_score:.2f} | intent={intent}")
@@ -510,8 +775,8 @@ def ask_smart_bot(user_query: str, history: list) -> str:
                 "يرجى إعادة المحاولة أو صياغة سؤالك بشكل مختلف."
             )
 
-        # ── 8. LLM returned مجهول → web fallback ────────────────────
-        if "مجهول" in llm_ans:
+        # ── 8. LLM returned unknown → web fallback then escalate ────
+        if is_unknown_response(llm_ans):
             print("🔴 LLM said مجهول → web fallback")
             web_ans = search_just_website(query)
             if web_ans:
@@ -523,18 +788,27 @@ def ask_smart_bot(user_query: str, history: list) -> str:
                     (query, "Pending")
                 )
                 conn.commit()
+                cursor.execute(
+                    "INSERT INTO pending_questions (user_question, status) VALUES (?, ?)",
+                    (query, "Pending")
+                )
+                conn.commit()
                 return (
                     "سؤالك وصلني ✅\n"
                     "لا أملك معلومات رسمية عن هذا الموضوع حالياً، "
                     "لذا سأحوّله لرئيس القسم للرد عليك قريباً.\n"
-                    "هل هناك شيء آخر يمكنني مساعدتك به؟"
+                    "هل يمكنك إضافة تفاصيل أكثر لمساعدتي في فهم سؤالك؟"
                 )
+            # Unknown intent — ask for clarification
             return (
                 "لم أجد معلومات كافية عن هذا الموضوع 🤔\n"
-                "هل يمكنك توضيح ما تقصده؟"
+                "هل يمكنك توضيح سؤالك أكثر؟ مثلاً: ذكر اسم الدكتور أو المادة أو الإجراء المحدد."
             )
 
-        # ── 9. LLM answered normally ─────────────────────────────────
+        # ── 9. LLM answered normally — append PDF sources if used ─────
+        if pdf_sources_used:
+            sources_block = "\n".join(f"📄 {s}" for s in pdf_sources_used)
+            return f"{llm_ans}\n\n**المصادر:**\n{sources_block}"
         return llm_ans
 
     except Exception as e:
@@ -594,6 +868,29 @@ def status_api():
         "model":         OLLAMA_MODEL,
         "rows_loaded":   len(df),
     })
+
+
+@app.route("/api/test-ollama", methods=["GET"])
+def test_ollama():
+    """Quick diagnostic — visit /api/test-ollama in browser to see Ollama status."""
+    import traceback as tb
+    result = {"http_ok": False, "chat_ok": False, "model": OLLAMA_MODEL, "error": None}
+    try:
+        r = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=5)
+        result["http_ok"] = r.status_code == 200
+        result["available_models"] = [m["name"] for m in r.json().get("models", [])]
+    except Exception as e:
+        result["error"] = f"HTTP: {e}"
+    try:
+        resp = ollama.chat(model=OLLAMA_MODEL,
+                           messages=[{"role": "user", "content": "مرحبا"}],
+                           options={"temperature": 0.1})
+        text = resp.message.content if hasattr(resp, "message") else resp["message"]["content"]
+        result["chat_ok"] = True
+        result["test_reply"] = text[:100]
+    except Exception as e:
+        result["chat_error"] = f"{type(e).__name__}: {e}"
+    return jsonify(result)
 
 if __name__ == "__main__":
     app.run(port=5000, debug=False)
