@@ -90,7 +90,7 @@ def _extract_pdf_text(source: str) -> list[dict]:
                 "Referer": JUST_BASE_URL,
             })
             if r.status_code != 200:
-                print(f"⚠️  PDF HTTP {r.status_code}: {label}")
+                print(f" PDF HTTP {r.status_code}: {label}")
                 return []
             data = io.BytesIO(r.content)
         else:
@@ -98,7 +98,7 @@ def _extract_pdf_text(source: str) -> list[dict]:
             path = os.path.join(os.path.dirname(os.path.abspath(__file__)), source) \
                    if not os.path.isabs(source) else source
             if not os.path.exists(path):
-                print(f"⚠️  PDF not found: {path}")
+                print(f" PDF not found: {path}")
                 return []
             data = open(path, "rb")
 
@@ -110,10 +110,10 @@ def _extract_pdf_text(source: str) -> list[dict]:
             if text:
                 pages.append({"text": text, "source": source, "page": i})
         doc.close()
-        print(f"✅ PDF loaded: {label} ({len(pages)} pages)")
+        print(f" PDF loaded: {label} ({len(pages)} pages)")
         return pages
     except Exception as e:
-        print(f"❌ PDF load error [{label}]: {e}")
+        print(f" PDF load error [{label}]: {e}")
         return []
 
 def _chunk_pages(pages: list[dict]) -> list[dict]:
@@ -145,7 +145,7 @@ def load_pdfs():
     """Call once at startup — loads all configured PDFs into memory."""
     global _pdf_chunks, _pdf_index, _pdf_ready
     if not PDF_SOURCES:
-        print("ℹ️  No PDF sources configured (PDF_SOURCES is empty).")
+        print("  No PDF sources configured (PDF_SOURCES is empty).")
         return
     pages = []
     for src in PDF_SOURCES:
@@ -153,7 +153,7 @@ def load_pdfs():
     _pdf_chunks = _chunk_pages(pages)
     _pdf_index  = _build_pdf_index(_pdf_chunks)
     _pdf_ready  = bool(_pdf_chunks)
-    print(f"📄 PDF index ready: {len(_pdf_chunks)} chunks from {len(PDF_SOURCES)} source(s)")
+    print(f" PDF index ready: {len(_pdf_chunks)} chunks from {len(PDF_SOURCES)} source(s)")
 
 def search_pdf(query: str, top_k: int = 4) -> list[dict]:
     """Return the top-k most relevant PDF chunks for a query."""
@@ -210,12 +210,12 @@ def load_excel_data():
     df = (pd.concat(frames, ignore_index=True)
             .dropna(subset=["Question", "Answer"]))
     df = df[df["Answer"].astype(str).str.strip() != ""].reset_index(drop=True)
-    print(f"✅ Loaded {len(df)} rows from {len(xl.sheet_names)} sheet(s)")
+    print(f" Loaded {len(df)} rows from {len(xl.sheet_names)} sheet(s)")
     return df
 
 df = load_excel_data()
 
-print("⚙️  Loading embedding model …")
+print("  Loading embedding model …")
 sentence_model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
 
 def get_embed_texts(dataframe):
@@ -236,7 +236,7 @@ def build_index(dataframe):
     return idx
 
 faiss_index = build_index(df)
-print("✅ Ready.")
+print(" Ready.")
 
 # ==========================================
 # 4. Ollama Health (cached 30s)
@@ -431,7 +431,7 @@ def _fetch_text(url: str, timeout: int = 8) -> str | None:
         text = re.sub(r'&[a-z]+;', ' ', text)
         return re.sub(r'\s+', ' ', text).strip()
     except Exception as e:
-        print(f"⚠️ fetch: {e}")
+        print(f" fetch: {e}")
         return None
 
 # Pages to search — ordered by relevance; first match wins for source attribution
@@ -445,7 +445,7 @@ JUST_PAGES = [
 ]
 
 def search_just_website(query: str) -> str | None:
-    print(f"🌐 Searching JUST for: {query[:60]}")
+    print(f" Searching JUST for: {query[:60]}")
     snippets   = []   # (text_snippet, source_url, source_label)
     source_url   = None
     source_label = None
@@ -492,7 +492,7 @@ def search_just_website(query: str) -> str | None:
                 source_label = "نتائج البحث في موقع الجامعة"
             snippets.append(text[:1000])
     except Exception as e:
-        print(f"⚠️ DDG: {e}")
+        print(f" DDG: {e}")
 
     if not snippets:
         return None
@@ -510,7 +510,7 @@ def search_just_website(query: str) -> str | None:
 
     if result and not is_unknown_response(result):
         # Build attribution line with actual URL
-        src_line = f"🔗 المصدر: [{source_label}]({source_url})" if source_url else "🔗 المصدر: الموقع الرسمي للجامعة"
+        src_line = f" المصدر: [{source_label}]({source_url})" if source_url else " المصدر: الموقع الرسمي للجامعة"
         return f"{result}\n\n{src_line}"
     return None
 
@@ -569,7 +569,7 @@ def _call_ollama(messages: list) -> str | None:
             raw = resp["message"]["content"].strip()
         return clean_arabic_output(raw)
     except Exception as e:
-        print(f"🚨 Ollama error ({type(e).__name__}): {e}")
+        print(f" Ollama error ({type(e).__name__}): {e}")
         _ollama_cache["ts"] = 0
         return None
 
@@ -618,7 +618,7 @@ def meta_answer(query: str) -> str | None:
         return (
             "إنا **المرشد الأكاديمي الذكي** 🎓\n"
             "مساعد آلي مخصص لقسم علم البيانات في جامعة العلوم والتكنولوجيا.\n"
-            "أستطيع مساعدتك في أسئلتك الأكاديمية أو حتى مجرد الدردشة! 😊"
+            "أستطيع مساعدتك في أسئلتك الأكاديمية أو حتى مجرد الدردشة! "
         )
     if any(w in q for w in ["موديل","نموذج","ollama","llm"]):
         ok = is_ollama_available()
@@ -637,7 +637,7 @@ def meta_answer(query: str) -> str | None:
             "**4️⃣ Escalation:** أحوّل للقسم إذا السؤال جديد تماماً"
         )
     if re.search(r"مين\s*(صمم|برمجك|عملك)", q):
-        return "تم تطويري كمشروع تخرج في قسم علم البيانات 🎓"
+        return "تم تطويري كمشروع تخرج في قسم علم البيانات "
     return None
 
 
@@ -730,7 +730,7 @@ def ask_smart_bot(user_query: str, history: list) -> str:
         norm_q = normalize(query)
         is_name_q = any(w in norm_q for w in _NAME_TRIGGERS)
         if best_score >= THRESHOLD_DIRECT and is_name_q:
-            print(f"✅ Direct name-hit ({best_score:.2f})")
+            print(f" Direct name-hit ({best_score:.2f})")
             return str(best_ans)
 
         # ── 5. Build context: Excel DB + PDF chunks ────────────────
@@ -752,14 +752,14 @@ def ask_smart_bot(user_query: str, history: list) -> str:
         db_context = "\n".join(ctx_parts) if ctx_parts else None
 
         # ── 6. Call LLM ──────────────────────────────────────────────
-        print(f"🤖 LLM | score={best_score:.2f} | intent={intent}")
+        print(f" LLM | score={best_score:.2f} | intent={intent}")
         llm_ans = ollama_chat(query, history, db_context)
 
         # ── 7. Ollama offline → return best DB answer directly ───────
         # FIX: NO more canned "أنا هنا لمساعدتك" when Ollama is down.
         # If we have a DB hit, return it. If not, give a helpful offline message.
         if llm_ans is None:
-            print("⚠️  Ollama offline — using direct DB answer")
+            print("  Ollama offline — using direct DB answer")
             if best_ans and best_score >= 0.45:
                 return str(best_ans)
             if intent == "conversational":
@@ -777,7 +777,7 @@ def ask_smart_bot(user_query: str, history: list) -> str:
 
         # ── 8. LLM returned unknown → web fallback then escalate ────
         if is_unknown_response(llm_ans):
-            print("🔴 LLM said مجهول → web fallback")
+            print(" LLM said مجهول → web fallback")
             web_ans = search_just_website(query)
             if web_ans:
                 return web_ans
@@ -812,7 +812,7 @@ def ask_smart_bot(user_query: str, history: list) -> str:
         return llm_ans
 
     except Exception as e:
-        print(f"🚨 Error: {e}")
+        print(f" Error: {e}")
         traceback.print_exc()
         return "أواجه مشكلة تقنية مؤقتة، يرجى المحاولة مجدداً."
 
