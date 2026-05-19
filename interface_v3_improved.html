@@ -1822,7 +1822,6 @@
     <button onclick="setTTSRate(1.0)" class="tts-rate-btn active" id="rate-normal">عادي</button>
     <button onclick="setTTSRate(1.4)" class="tts-rate-btn" id="rate-fast">سريع</button>
     <span style="margin:0 4px;color:var(--border2);">|</span>
-    <button onclick="toggleTTSVoice()" class="tts-rate-btn" id="voice-toggle" title="تبديل الصوت">🗣️ أنثى</button>
     <button onclick="stopTTS()" style="margin-right:8px;background:var(--red);color:#fff;border:none;border-radius:6px;padding:3px 10px;cursor:pointer;font-size:12px;">⏹ إيقاف</button>
   </div>
 
@@ -2116,12 +2115,6 @@
         stopTTS();
         setTimeout(() => speakText(btn, text), 200);
       }
-    }
-
-    function toggleTTSVoice() {
-      _ttsVoice = _ttsVoice === 'female' ? 'male' : 'female';
-      const btn = document.getElementById('voice-toggle');
-      btn.textContent = _ttsVoice === 'female' ? '🗣️ أنثى' : '🗣️ ذكر';
     }
 
     function stopTTS() {
