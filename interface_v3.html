@@ -1610,37 +1610,10 @@
         transform: translateY(0);
       }
     }
-.mobile-close-btn {
-      display: none;
-      background: none;
-      border: none;
-      color: var(--muted);
-      font-size: 18px;
-      cursor: pointer;
-      padding: 4px;
-    }
-    
     @media(max-width:768px) {
-      .mobile-close-btn { display: block; } /* لإظهار الزر فقط على الموبايل */
-      .sidebar {
-        width: 240px;
-      }
-      .main {
-        margin-right: 0;
-      }
-      .stats-grid {
-        grid-template-columns: repeat(2, 1fr);
-      }
-    }
-    
-
-      .main {
-        margin-right: 0;
-      }
-
-      .stats-grid {
-        grid-template-columns: repeat(2, 1fr);
-      }
+      .sidebar { width: 240px; }
+      .main { margin-right: 0; }
+      .stats-grid { grid-template-columns: repeat(2, 1fr); }
     }
   </style>
 </head>
@@ -1663,7 +1636,7 @@
         <div class="logo-title">المرشد الأكاديمي</div>
         <div class="logo-sub">JUST · Data Science Dept.</div>
       </div>
-      <button class="mobile-close-btn" onclick="toggleSidebar()">✖</button>
+
     </div>
 
     <div class="sidebar-status" onclick="checkStatus()" title="اضغط للتحديث">
@@ -1868,7 +1841,7 @@
     const API = '';
     let chatHistory = [];
     let selectedIds = new Set();
-    let sidebarOpen = true;
+    let sidebarOpen = false;
     let recognition = null;
     let isRecording = false;
     let dbRows = [];
@@ -1881,18 +1854,29 @@
     }
 
     // ── Panel switching ──
-    function switchPanel(name, btn) {
-      document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
-      document.querySelectorAll('.nav-item').forEach(b => b.classList.remove('active'));
-      document.getElementById('panel-' + name).classList.add('active');
-      btn.classList.add('active');
-      const titles = { chat: 'المحادثة', search: 'البحث في قاعدة البيانات', admin: 'لوحة تحكم القسم' };
-      const subs = { chat: 'اسأل عن أي شيء يخص القسم', search: 'ابحث في الأسئلة والإجابات', admin: 'إدارة الأسئلة المعلقة' };
-      document.getElementById('topbar-title').textContent = titles[name];
-      document.getElementById('topbar-sub').textContent = subs[name];
-      if (name === 'admin') loadAdmin();
-      if (name === 'search') loadDbForSearch();
+function switchPanel(name, btn) {
+  // قفل الحماية للوحة القسم
+  if (name === 'admin') {
+    const pwd = prompt("عذراً، هذه المساحة مخصصة لرئيس القسم. الرجاء إدخال كلمة المرور:");
+    if (pwd !== "Admin#1236") { // تقدر تغير كلمة المرور من هون
+      showToast("❌ كلمة المرور خاطئة، غير مصرح لك بالدخول", "error");
+      return;
     }
+  }
+
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(b => b.classList.remove('active'));
+  document.getElementById('panel-' + name).classList.add('active');
+  btn.classList.add('active');
+  
+  const titles = { chat: 'المحادثة', search: 'البحث في قاعدة البيانات', admin: 'لوحة تحكم القسم' };
+  const subs = { chat: 'اسأل عن أي شيء يخص القسم', search: 'ابحث في الأسئلة والإجابات', admin: 'إدارة الأسئلة المعلقة' };
+  document.getElementById('topbar-title').textContent = titles[name];
+  document.getElementById('topbar-sub').textContent = subs[name];
+  
+  if (name === 'admin') loadAdmin();
+  if (name === 'search') loadDbForSearch();
+}
 
     // ── Status ──
     async function checkStatus() {
@@ -2423,11 +2407,10 @@
     }
 
     // ── Init ──
-    // إغلاق القائمة افتراضياً على الموبايل
-    if (window.innerWidth <= 768) {
-      toggleSidebar();
-    }
-    
+    // الشريط الجانبي مخفي افتراضياً
+    document.getElementById('sidebar').classList.add('collapsed');
+    document.getElementById('main').classList.add('expanded');
+
     checkStatus();
     setInterval(checkStatus, 30000);
   </script>
